@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+  <h2>Login</h2>
+  {% if error %}<div class="flash">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <input type="text" name="username" placeholder="Username" required>
+    <input type="password" name="password" placeholder="Password" required>
+    <div style="margin-top:12px"><button type="submit">Login</button></div>
+  </form>
+  <p style="margin-top:14px"><a href="{{ url_for('register') }}">No account? Register</a></p>
+  <p style="margin-top:6px"><a href="{{ url_for('forgot_password') }}">Forgot password?</a></p>
+</div>
+{% endblock %}

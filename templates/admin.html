@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+  <h2>Admin</h2>
+  <p><strong>Queue:</strong> {{ queue_length }} waiting &middot; {{ '15s per build' }}</p>
+  {% if queue_entries %}
+    <table>
+      <tr><th>#</th><th>User ID</th><th>VPS ID</th></tr>
+      {% for e in queue_entries %}
+        <tr><td>{{ loop.index }}</td><td>{{ e.user_id }}</td><td>{{ e.vps_id }}</td></tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p style="color:var(--text-dim)">Queue is empty.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Grant Custom VPS</h3>
+  <p style="color:var(--text-dim);font-size:13px;margin-bottom:6px">
+    Give a specific user a high-tier VPS outside the standard plan. Builds immediately, skips the queue.
+    Max {{ '160' }}GB RAM, {{ '20' }} CPU cores, {{ '500' }}GB disk.
+  </p>
+  <p style="color:var(--text-faint);font-size:12px;margin-bottom:14px">
+    This host actually has: <strong>{{ host.cpu_cores }} CPU cores</strong>, <strong>{{ host.ram_mb // 1024 }}GB RAM</strong> total.
+    Requests above this get refused rather than silently under-delivered.
+  </p>
+  <p style="color:var(--text-faint);font-size:12px;margin-bottom:14px">
+    Disk budget: <strong>{{ host.disk_allocated_gb }} / {{ host.disk_budget_gb }} GB</strong> committed
+    (max advertised: {{ (host.disk_budget_gb / 1024) | round(1) }}TB).
+    {% if host.real_disk_gb %}Host's real physical disk is ~{{ (host.real_disk_gb / 1024) | round(1) }}TB, but that
+    number is not used for allocation — some of it is already eaten by something that overran its expected
+    usage, so the {{ (host.disk_budget_gb / 1024) | round(1) }}TB budget above is the actual enforced cap.{% endif %}
+  <form method="POST" action="{{ url_for('admin_grant_vps') }}">
+    <input type="text" name="username" placeholder="Username" required>
+
+    <select id="preset-select" style="margin-bottom:10px">
+      <option value="">— Quick preset (optional) —</option>
+      <option value="4,60,80">Standard — 4 cores / 60GB / 80GB disk</option>
+      <option value="8,80,150">Large — 8 cores / 80GB / 150GB disk</option>
+      <option value="12,120,250">XL — 12 cores / 120GB / 250GB disk</option>
+      <option value="20,160,500">Max — 20 cores / 160GB / 500GB disk</option>
+    </select>
+
+    <input type="number" id="ram_gb" name="ram_gb" placeholder="RAM (GB, max 160)" min="1" max="160" required>
+    <input type="number" id="cpu_cores" name="cpu_cores" placeholder="CPU cores (max 20)" min="1" max="20" required>
+    <input type="number" id="disk_gb" name="disk_gb" placeholder="Disk (GB, max 500)" min="1" max="500" required>
+    <div style="margin-top:10px"><button type="submit">Grant VPS</button></div>
+  </form>
+  <script>
+    document.getElementById('preset-select').addEventListener('change', function(e) {
+      if (!e.target.value) return;
+      const [cpu, ram, disk] = e.target.value.split(',');
+      document.getElementById('cpu_cores').value = cpu;
+      document.getElementById('ram_gb').value = ram;
+      document.getElementById('disk_gb').value = disk;
+    });
+  </script>
+</div>
+
+<div class="card">
+  <h3>VPS Instances</h3>
+  <table>
+    <tr><th>ID</th><th>User</th><th>Container</th><th>Status</th><th>Terminal</th><th>Actions</th></tr>
+    {% for v in vpses %}
+      <tr>
+        <td>{{ v.id }}</td>
+        <td>{{ v.username }}</td>
+        <td><code>{{ v.container_id }}</code></td>
+        <td>{{ v.status }}</td>
+        <td>{% if v.status == 'running' and v.ssh_command %}<a href="{{ v.ssh_command }}" target="_blank" rel="noopener">open</a>{% else %}—{% endif %}</td>
+        <td>
+          <form method="POST" action="{{ url_for('admin_vps_action', vps_id=v.id, action='suspend') }}"><button>Suspend</button></form>
+          <form method="POST" action="{{ url_for('admin_vps_action', vps_id=v.id, action='unsuspend') }}"><button>Unsuspend</button></form>
+          <form method="POST" action="{{ url_for('admin_vps_action', vps_id=v.id, action='delete') }}"><button class="btn-danger">Delete</button></form>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h3>Users</h3>
+  <table>
+    <tr><th>ID</th><th>Username</th><th>Recovery Code Set</th><th>Signup IP</th><th>Admin</th></tr>
+    {% for u in users %}
+      <tr>
+        <td>{{ u.id }}</td>
+        <td>{{ u.username }}</td>
+        <td>{{ 'Yes' if u.recovery_code_shown else 'No' }}</td>
+        <td>{{ u.signup_ip }}</td>
+        <td>{{ 'Yes' if u.is_admin else 'No' }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}
