@@ -48,6 +48,11 @@ def get_host_capacity():
     standard) exactly as before — this budget only caps the SUM across all
     VPSes so the panel never promises more than 6TB total, no matter what
     the host's real (currently unreliable) disk size is.
+
+    disk_allocated_gb (from get_allocated_disk_gb()) is REAL usage, not the
+    sum of quotas — see that function's docstring. A VPS's 80GB quota is
+    just the ceiling it's allowed to grow into; it only counts against this
+    budget for what it's actually written.
     """
     cpu_cores = os.cpu_count() or 1
     ram_mb = 0
@@ -85,34 +90,108 @@ def get_host_capacity():
 TOTAL_DISK_BUDGET_GB = 6 * 1024  # 6TB
 
 
+def _quota_gb(inst):
+    """Fallback helper: the GB figure from an instance's configured
+    devices.root.size (its quota/ceiling, not what it's actually using)."""
+    try:
+        size = inst.devices.get("root", {}).get("size", "")
+        if size.upper().endswith("GB"):
+            return int(size[:-2])
+        elif size.upper().endswith("TB"):
+            return int(size[:-2]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
 def get_allocated_disk_gb():
     """
-    Ground-truth sum of every vps- container's configured root disk quota
-    (the same GB figure enforced via each container's devices.root.size),
-    read directly from LXD rather than the DB — so it can't drift out of
-    sync with stale/deleted rows the way a DB-side running total could.
+    Ground-truth disk accounting against the panel-wide TOTAL_DISK_BUDGET_GB,
+    based on what every vps- container is ACTUALLY using on disk right now —
+    not its configured quota.
+
+    Every VPS still gets a devices.root.size quota (80GB standard) as its own
+    ceiling — that's untouched. But a fresh VPS that's used 3GB of its 80GB
+    quota should only cost the budget 3GB, not 80GB. Charging the full quota
+    up front (the old behavior) is why the budget filled up to 6130/6144GB
+    while the physical disk was nowhere near full: 76+ mostly-empty VPSes at
+    80GB nominal each eat the whole budget without anyone having written
+    that much data.
+
+    LXD reports live per-device usage via instance.state().disk (this is
+    what "lxc info <name>" shows as "Disk usage: root: ..."), read directly
+    from LXD rather than the DB so it can't drift out of sync with stale or
+    deleted rows. If a container's real usage can't be read for some reason
+    (storage driver doesn't support usage reporting, container unreachable,
+    etc.) we fall back to counting its configured quota for that one
+    container — better to overcount a handful of containers than to let the
+    budget silently under-enforce.
     """
-    total = 0
+    total_bytes = 0
     for inst in client.instances.all():
         if not inst.name.startswith("vps-"):
             continue
+
+        usage_bytes = None
         try:
-            size = inst.devices.get("root", {}).get("size", "")
-            if size.upper().endswith("GB"):
-                total += int(size[:-2])
-            elif size.upper().endswith("TB"):
-                total += int(size[:-2]) * 1024
+            state = inst.state()
+            usage_bytes = (state.disk or {}).get("root", {}).get("usage")
         except Exception:
-            continue
-    return total
+            usage_bytes = None
+
+        if usage_bytes:
+            total_bytes += usage_bytes
+        else:
+            total_bytes += _quota_gb(inst) * (1024 ** 3)
+
+    return total_bytes // (1024 ** 3)
+
+
+# Physical safety net, independent of the budget above. Once real usage
+# (not quotas) is what the budget tracks, the sum of every VPS's *quota*
+# can legitimately exceed TOTAL_DISK_BUDGET_GB and even the host's real
+# disk — that's the whole point of thin provisioning, and it's fine right
+# up until several VPSes actually grow into their quotas at the same time.
+# This refuses new allocations once real free space on the host gets low,
+# regardless of what the budget math says, so that scenario fails loudly
+# (a blocked VPS creation) instead of as an actual full disk on the host.
+MIN_FREE_DISK_GB = 100
 
 
 def can_allocate_disk(additional_gb):
-    """Returns (allowed: bool, allocated_gb: int, budget_gb: int). Checked
-    before every VPS creation/grant so the panel can refuse loudly instead
-    of quietly overcommitting past the 6TB budget."""
+    """
+    Returns (allowed: bool, allocated_gb: int, budget_gb: int, reason: str | None).
+    reason is only set when allowed is False, and explains WHICH check
+    failed — the caller can show it directly instead of a generic message.
+
+    Two independent checks, either one can block:
+      1. Budget: real usage across all VPSes + additional_gb must stay
+         under TOTAL_DISK_BUDGET_GB.
+      2. Physical safety net: real free space on the host must stay above
+         MIN_FREE_DISK_GB, no matter what the budget check says.
+    """
     allocated = get_allocated_disk_gb()
-    return (allocated + additional_gb) <= TOTAL_DISK_BUDGET_GB, allocated, TOTAL_DISK_BUDGET_GB
+    budget_ok = (allocated + additional_gb) <= TOTAL_DISK_BUDGET_GB
+
+    real_free_gb = None
+    try:
+        usage = shutil.disk_usage("/")
+        real_free_gb = usage.free // (1024 ** 3)
+    except Exception:
+        pass
+
+    safety_ok = real_free_gb is None or real_free_gb >= MIN_FREE_DISK_GB
+
+    if not safety_ok:
+        return False, allocated, TOTAL_DISK_BUDGET_GB, (
+            f"Only {real_free_gb}GB free on the physical disk (minimum "
+            f"{MIN_FREE_DISK_GB}GB kept in reserve) — refusing new allocations "
+            f"until space actually frees up, even though the budget has room."
+        )
+    if not budget_ok:
+        return False, allocated, TOTAL_DISK_BUDGET_GB, None
+
+    return True, allocated, TOTAL_DISK_BUDGET_GB, None
 
 
 def get_container(container_id):
@@ -197,7 +276,7 @@ def create_vps(username, cpu_limit=1, ram_limit_mb=1024, disk_limit_gb=10, image
         "devices": {
             "root": {
                 "path": "/",
-                "pool": "default",
+                "pool": "zfs-new",
                 "type": "disk",
                 "size": f"{disk_limit_gb}GB",
             }
@@ -264,6 +343,74 @@ def restart_vps(container_id):
     return {"status": "restarted"}
 
 
+def _parse_mem_mb(raw):
+    """Parse an LXD limits.memory string ('61440MB', '60GB') back to MB."""
+    try:
+        raw = raw.upper().strip()
+        if raw.endswith("GB"):
+            return int(raw[:-2]) * 1024
+        if raw.endswith("MB"):
+            return int(raw[:-2])
+    except Exception:
+        pass
+    return None
+
+
+def get_vps_specs(container_id):
+    """
+    Reads back the cpu/ram/disk this specific container is actually
+    configured with — not the standard defaults. Needed so reinstall_vps()
+    recreates admin-granted custom-spec VPSes at their real size instead of
+    silently downgrading everyone to the standard 4-core/60GB/80GB plan.
+    Returns None if the container can't be found/read (caller falls back
+    to the standard defaults in that case).
+    """
+    inst = get_container(container_id)
+    if not inst:
+        return None
+    cpu_raw = inst.config.get("limits.cpu", "4")
+    try:
+        cpu_cores = int(cpu_raw)
+    except Exception:
+        cpu_cores = 4
+    ram_mb = _parse_mem_mb(inst.config.get("limits.memory", "61440MB")) or 61440
+    disk_gb = _quota_gb(inst) or STANDARD_VPS_DISK_GB
+    return {"cpu_cores": cpu_cores, "ram_mb": ram_mb, "disk_gb": disk_gb}
+
+
+def reinstall_vps(container_id, username):
+    """
+    Wipes a VPS and reinstalls it from scratch: deletes the existing
+    container and creates a brand new one with the SAME cpu/ram/disk specs
+    it had before (so an admin-granted custom-spec VPS gets reinstalled at
+    its real size, not downgraded to the standard plan), then reinstalls
+    sshx and opens a fresh terminal session — same path as a brand new
+    Create VPS.
+
+    This is destructive: everything on the old disk is gone, and the old
+    sshx terminal link stops working immediately. Returns
+    (new_container_id, new_ssh_url) on success. Raises on failure — the
+    caller should treat that exactly like a failed initial build (status
+    'failed', keep the DB row so the user can see what happened).
+    """
+    specs = get_vps_specs(container_id) or {
+        "cpu_cores": 4, "ram_mb": 61440, "disk_gb": STANDARD_VPS_DISK_GB
+    }
+    # Best-effort delete: if the container's already gone (e.g. an admin
+    # deleted it out from under this request) that's fine — recreating it
+    # is still the right move rather than aborting the reinstall.
+    try:
+        delete_vps(container_id)
+    except Exception:
+        pass
+    return create_vps_container(
+        username,
+        cpu_limit=specs["cpu_cores"],
+        ram_limit_mb=specs["ram_mb"],
+        disk_limit_gb=specs["disk_gb"],
+    )
+
+
 def delete_vps(container_id):
     inst = get_container(container_id)
     if not inst:
@@ -305,6 +452,33 @@ def get_vps_status(container_id):
         "status": inst.status.lower(),
         "name": inst.name,
     }
+
+
+def sync_status(container_id, db_status):
+    """
+    Ground-truth reconciliation between the DB's idea of a VPS's status and
+    what LXD actually reports. Only reconciles the 'running'/'stopped' pair
+    — the two states a container can drift into on its own without the
+    panel knowing (a host reboot with no container autostart, an OOM kill,
+    a crash, or someone using `lxc stop` directly on the host). Without
+    this, the DB could say 'running' forever after a container silently
+    died, permanently hiding the Start button behind a Stop button that
+    always fails.
+
+    Leaves 'queued', 'creating', 'failed', and 'suspended' untouched —
+    those are managed explicitly by the app/queue and aren't states LXD
+    itself reports.
+
+    Returns the corrected status string (same as db_status if nothing
+    drifted, or if the container can't be reached at all — fails closed
+    to whatever the DB already believed rather than guessing).
+    """
+    if db_status not in ("running", "stopped"):
+        return db_status
+    real = get_vps_status(container_id).get("status")
+    if real in ("running", "stopped"):
+        return real
+    return db_status
 
 
 def list_all_vps():
