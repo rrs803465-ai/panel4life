@@ -7,6 +7,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from vps import create_vps_container, destroy_vps, suspend_vps, unsuspend_vps, regen_sshx, get_container_stats, build_logs_stream, can_create_vps, can_allocate_disk, add_port_forward, remove_port_forward, list_port_forwards, MAX_TOTAL_VPS, get_host_capacity
 from monitor import start_monitor
 import queue_manager as queue
+import node_mesh
+import ip_intel
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -78,7 +80,7 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS vps (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER UNIQUE NOT NULL,
+        user_id INTEGER NOT NULL,
         container_id TEXT NOT NULL,
         ssh_command TEXT,
         status TEXT DEFAULT 'creating',
@@ -114,17 +116,42 @@ def init_db():
         FOREIGN KEY(user_id) REFERENCES users(id)
     );
     """)
+    # Migrate older DBs where vps.user_id had a UNIQUE constraint (one VPS
+    # per user) — admins can now grant multiple VPSes per user, so that
+    # constraint has to go. SQLite can't ALTER a column's constraints
+    # directly; rebuild the table instead, preserving all existing rows.
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='vps'").fetchone()
+    if row and row["sql"] and "UNIQUE" in row["sql"].upper():
+        db.executescript("""
+        ALTER TABLE vps RENAME TO vps_old;
+        CREATE TABLE vps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            container_id TEXT NOT NULL,
+            ssh_command TEXT,
+            status TEXT DEFAULT 'creating',
+            creator_ip TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_regen INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        INSERT INTO vps SELECT * FROM vps_old;
+        DROP TABLE vps_old;
+        """)
     # Best-effort migration for DBs created before these columns existed.
     for stmt in [
         "ALTER TABLE users ADD COLUMN recovery_code_hash TEXT",
         "ALTER TABLE users ADD COLUMN recovery_code_shown INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN youtube_verified INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN is_vpn_signup INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN vpn_provider TEXT",
     ]:
         try:
             db.execute(stmt)
         except sqlite3.OperationalError:
             pass  # column already exists
     db.commit()
+    node_mesh.init_mesh_tables(db)
     db.close()
 
 
@@ -180,8 +207,14 @@ def register():
         if db.execute("SELECT 1 FROM users WHERE username=?", (u,)).fetchone():
             return render_template("register.html", error="Username taken")
 
-        db.execute("INSERT INTO users(username,password,signup_ip,created_at) VALUES(?,?,?,?)",
-                   (u, generate_password_hash(p), ip, int(time.time())))
+        # Flagged for the admin panel only — registration itself is never
+        # blocked by this, just the ability to actually create a VPS (see
+        # vps_create()).
+        is_vpn, vpn_label = ip_intel.is_vpn_or_proxy(ip)
+
+        db.execute("""INSERT INTO users(username,password,signup_ip,created_at,is_vpn_signup,vpn_provider)
+                     VALUES(?,?,?,?,?,?)""",
+                   (u, generate_password_hash(p), ip, int(time.time()), int(is_vpn), vpn_label))
         db.commit()
         return redirect(url_for("login"))
     return render_template("register.html")
@@ -278,17 +311,18 @@ def delete_account():
         if not row or not row["recovery_code_hash"] or not check_password_hash(row["recovery_code_hash"], code):
             return render_template("delete_account.html", error="Incorrect recovery code.")
 
-        # Tear down their VPS (if any) and clean up everything tied to this
+        # Tear down ALL of their VPSes (a user can now have more than one,
+        # granted via the admin panel) and clean up everything tied to this
         # account. Container teardown failure doesn't block account deletion
         # — an already-gone/broken container shouldn't leave someone stuck.
-        vps = db.execute("SELECT * FROM vps WHERE user_id=?", (current_user.id,)).fetchone()
-        if vps:
+        all_vps = db.execute("SELECT * FROM vps WHERE user_id=?", (current_user.id,)).fetchall()
+        for vps in all_vps:
             try:
                 destroy_vps(vps["container_id"])
             except Exception as e:
                 print(f"[DELETE ACCOUNT] Container teardown failed (continuing anyway): {e}")
             db.execute("DELETE FROM port_forwards WHERE vps_id=?", (vps["id"],))
-            db.execute("DELETE FROM vps WHERE id=?", (vps["id"],))
+        db.execute("DELETE FROM vps WHERE user_id=?", (current_user.id,))
 
         db.execute("DELETE FROM feedback WHERE user_id=?", (current_user.id,))
         db.execute("DELETE FROM users WHERE id=?", (current_user.id,))
@@ -305,7 +339,16 @@ def delete_account():
 @login_required
 def dashboard():
     db = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE user_id=?", (current_user.id,)).fetchone()
+    all_vps = db.execute("SELECT * FROM vps WHERE user_id=? ORDER BY created_at ASC",
+                          (current_user.id,)).fetchall()
+
+    selected_id = request.args.get("vps_id", type=int)
+    vps = None
+    if selected_id:
+        vps = next((v for v in all_vps if v["id"] == selected_id), None)
+    if not vps and all_vps:
+        vps = all_vps[0]
+
     feedback_rows = db.execute("""SELECT feedback.*, users.username FROM feedback
                                   JOIN users ON users.id = feedback.user_id
                                   ORDER BY feedback.created_at DESC LIMIT 20""").fetchall()
@@ -313,7 +356,7 @@ def dashboard():
     can_feedback = bool(vps and vps["status"] == "running" and vps["ssh_command"])
     forwards = db.execute("SELECT * FROM port_forwards WHERE vps_id=?", (vps["id"],)).fetchall() if vps else []
     can_forward = bool(vps and vps["status"] == "running")
-    return render_template("dashboard.html", vps=vps, feedback_rows=feedback_rows,
+    return render_template("dashboard.html", vps=vps, all_vps=all_vps, feedback_rows=feedback_rows,
                             queue_pos=queue_pos, slot_seconds=queue.SLOT_SECONDS,
                             can_feedback=can_feedback, forwards=forwards,
                             can_forward=can_forward, public_ip=PUBLIC_IPV4,
@@ -334,9 +377,22 @@ def vps_create():
     if db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (user_row["signup_ip"],)).fetchone():
         return "Your signup IP already owns a VPS", 403
 
+    # Live check — blocks creation outright while a VPN/proxy is on, on top
+    # of the is_vpn_signup flag recorded at registration time (which only
+    # informs the admin panel, doesn't block anything by itself).
+    is_vpn, vpn_label = ip_intel.is_vpn_or_proxy(ip)
+    if is_vpn:
+        return f"VPN/proxy detected ({vpn_label}) — disable it and try again to create a VPS.", 403
+
+    # Same "one VPS per IP" rule, extended across every node this one is
+    # paired with — see node_mesh.py for the fail-open-per-peer tradeoff.
+    found_elsewhere, other_node_url = node_mesh.check_ip_across_mesh(db, ip)
+    if found_elsewhere:
+        return f"This IP already owns a VPS on another node in the network ({other_node_url})", 403
+
     allowed, current = can_create_vps()
     if not allowed:
-        return f"Node VPS limit reached ({current}/{MAX_TOTAL_VPS}). No new VPS can be created right now — try again later.", 503
+        return "NODE IS FULL!! PLEASE WAIT FOR ANOTHER NODE BEING DEPLOYED BY DXD", 503
 
     disk_allowed, disk_allocated, disk_budget = can_allocate_disk(STANDARD_VPS_DISK_GB)
     if not disk_allowed:
@@ -349,10 +405,10 @@ def vps_create():
         return "Please wait a few seconds before trying again.", 429
     _last_create_click[ip] = now
 
-    db.execute("INSERT INTO vps(user_id,container_id,creator_ip,created_at,status) VALUES(?,?,?,?,?)",
-               (current_user.id, "pending", ip, now, "queued"))
+    cur = db.execute("INSERT INTO vps(user_id,container_id,creator_ip,created_at,status) VALUES(?,?,?,?,?)",
+                      (current_user.id, "pending", ip, now, "queued"))
     db.commit()
-    vps_id = db.execute("SELECT id FROM vps WHERE user_id=?", (current_user.id,)).fetchone()["id"]
+    vps_id = cur.lastrowid
 
     queue.enqueue(current_user.id, vps_id)
     return redirect(url_for("vps_view", vps_id=vps_id))
@@ -542,9 +598,12 @@ def regen_ssh(vps_id):
 @login_required
 def submit_feedback():
     db = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE user_id=?", (current_user.id,)).fetchone()
-    if not vps or vps["status"] != "running" or not vps["ssh_command"]:
-        return "You need a running VPS with working SSH access to leave feedback", 403
+    vps = db.execute(
+        "SELECT * FROM vps WHERE user_id=? AND status='running' AND ssh_command IS NOT NULL LIMIT 1",
+        (current_user.id,)
+    ).fetchone()
+    if not vps:
+        return "You need at least one running VPS with working terminal access to leave feedback", 403
 
     try:
         stars = int(request.form.get("stars", 0))
@@ -626,7 +685,9 @@ def admin():
     db = get_db()
     rows = db.execute("""SELECT vps.*, users.username FROM vps
                          JOIN users ON users.id = vps.user_id""").fetchall()
-    users = db.execute("SELECT id, username, signup_ip, is_admin, created_at, recovery_code_shown FROM users").fetchall()
+    users = db.execute(
+        "SELECT id, username, signup_ip, is_admin, created_at, recovery_code_shown, is_vpn_signup, vpn_provider FROM users"
+    ).fetchall()
     queue_entries = queue.peek_all()
     host = get_host_capacity()
     return render_template("admin.html", vpses=rows, users=users,
@@ -684,17 +745,20 @@ def admin_grant_vps():
     target = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
     if not target:
         return "No user with that username", 404
-    if db.execute("SELECT 1 FROM vps WHERE user_id=?", (target["id"],)).fetchone():
-        return "That user already has a VPS — remove it first if you want to replace it", 400
+    # No "already has a VPS" block here on purpose — this is the ONE path
+    # that's allowed to give a user a second (or third...) VPS. Self-service
+    # creation (vps_create()) still enforces one-per-user.
 
     allowed, current = can_create_vps()
     if not allowed:
-        return f"Node VPS limit reached ({current}/{MAX_TOTAL_VPS}). Free up a slot first.", 503
+        return "NODE IS FULL!! PLEASE WAIT FOR ANOTHER NODE BEING DEPLOYED BY DXD", 503
 
-    db.execute("INSERT INTO vps(user_id,container_id,creator_ip,created_at,status) VALUES(?,?,?,?,?)",
-               (target["id"], "pending", "admin-grant", int(time.time()), "creating"))
+    cur = db.execute("INSERT INTO vps(user_id,container_id,creator_ip,created_at,status) VALUES(?,?,?,?,?)",
+                      (target["id"], "pending", "admin-grant", int(time.time()), "creating"))
     db.commit()
-    vps_id = db.execute("SELECT id FROM vps WHERE user_id=?", (target["id"],)).fetchone()["id"]
+    vps_id = cur.lastrowid  # NOT a SELECT WHERE user_id=? lookup — a user can now
+    # have multiple VPS rows, which would make that query ambiguous and risk
+    # grabbing the wrong (pre-existing) VPS instead of the one just inserted.
 
     threading.Thread(
         target=_build_vps_custom,
@@ -727,8 +791,97 @@ def admin_vps_action(vps_id, action):
     return redirect(url_for("admin"))
 
 
+@app.route("/admin/nodes", methods=["GET", "POST"])
+@login_required
+def admin_nodes():
+    if not current_user.is_admin:
+        return "Forbidden", 403
+    db = get_db()
+    result = None
+    if request.method == "POST":
+        remote_url = request.form.get("remote_url", "").strip()
+        remote_code = request.form.get("remote_code", "").strip()
+        if not remote_url or not remote_code:
+            result = (False, "Enter both the remote node's URL and its 8-digit code.")
+        else:
+            result = node_mesh.pair_with_node(db, remote_url, remote_code)
+    nodes = node_mesh.list_nodes(db)
+    return render_template("admin_nodes.html", nodes=nodes, result=result,
+                            my_code=node_mesh.NODE_CODE, my_url=node_mesh.NODE_PUBLIC_URL,
+                            max_vps=MAX_TOTAL_VPS)
+
+
+# --- Internal mesh API — called BY other nodes, not by browsers/users ---
+
+@app.route("/api/node/pair", methods=["POST"])
+def api_node_pair():
+    """
+    Another node's admin is trying to connect to THIS node. Authenticated
+    purely by knowing this node's live NODE_CODE (see node_mesh.py's
+    docstring for the trust model this relies on).
+    """
+    data = request.get_json(silent=True) or {}
+    code = data.get("code", "")
+    requester_url = data.get("my_url", "")
+    db = get_db()
+    ok, result = node_mesh.accept_pairing(db, code, requester_url)
+    if not ok:
+        return jsonify({"error": result}), 403
+    return jsonify({"shared_secret": result})
+
+
+@app.route("/api/node/check_ip")
+def api_node_check_ip():
+    """Called by a paired node asking whether the given IP already owns a
+    VPS on THIS node. Requires a valid shared secret from a prior pairing."""
+    db = get_db()
+    peer_url = request.headers.get("X-Node-Url", "")
+    peer_secret = request.headers.get("X-Node-Secret", "")
+    if not node_mesh.verify_peer_secret(db, peer_url, peer_secret):
+        return jsonify({"error": "unauthorized"}), 403
+
+    ip = request.args.get("ip", "")
+    if not ip:
+        return jsonify({"error": "missing ip"}), 400
+
+    has_vps = bool(db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (ip,)).fetchone())
+    if not has_vps:
+        # Also cover "signed up from this IP, VPS created from elsewhere" —
+        # same logic vps_create() already applies locally.
+        has_vps = bool(db.execute(
+            "SELECT 1 FROM vps JOIN users ON users.id = vps.user_id WHERE users.signup_ip=?", (ip,)
+        ).fetchone())
+    return jsonify({"has_vps": has_vps})
+
+
+@app.route("/api/notifications/latest")
+@login_required
+def api_notifications_latest():
+    """Polled from base.html to drive the browser Notification + in-page
+    banner when e.g. a new node connects. See node_mesh.py's docstring for
+    why this isn't real background push."""
+    since = request.args.get("since", type=int, default=0)
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, message, created_at FROM notifications WHERE created_at > ? ORDER BY created_at ASC LIMIT 20",
+        (since,)
+    ).fetchall()
+    return jsonify({"notifications": [dict(r) for r in rows], "now": int(time.time())})
+
+
 if __name__ == "__main__":
     init_db()
+    print("=" * 50)
+    print(f" NODE PAIRING CODE: {node_mesh.NODE_CODE}")
+    print(" Give this code to another node's admin so THEY")
+    print(" can connect their node to this one (or vice versa)")
+    print(" from their /admin/nodes page.")
+    if node_mesh.NODE_PUBLIC_URL:
+        print(f" Public URL: {node_mesh.NODE_PUBLIC_URL}")
+    else:
+        print(" WARNING: NODE_PUBLIC_URL is not set — this node cannot")
+        print(" be paired with (or pair out to) another node until it is.")
+    print("=" * 50)
     start_monitor()
     queue.start_queue_worker(_build_vps)
     app.run(host="0.0.0.0", port=5000, threaded=True)
