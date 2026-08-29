@@ -1,6 +1,27 @@
 {% extends "base.html" %}
 {% block body %}
 <div class="card">
+  <h3>Message All</h3>
+  {% if broadcast and broadcast.active and broadcast.message %}
+    <p style="color:var(--text-dim);font-size:13px;margin-bottom:10px">Currently showing to everyone:</p>
+    <p style="background:rgba(255,193,7,0.14);border-left:3px solid rgba(255,193,7,0.5);padding:10px 14px;border-radius:var(--radius);margin-bottom:14px">
+      {{ broadcast.message }}
+    </p>
+    <form method="POST" action="{{ url_for('admin_broadcast_clear') }}" style="margin-bottom:16px">
+      <button type="submit" class="btn-danger">Stop Message</button>
+    </form>
+  {% else %}
+    <p style="color:var(--text-dim);font-size:13px;margin-bottom:14px">No message is currently showing.</p>
+  {% endif %}
+  <form method="POST" action="{{ url_for('admin_broadcast_set') }}">
+    <input type="text" name="message" placeholder="e.g. Subscribe to..."
+           maxlength="500" value="{{ broadcast.message if broadcast else '' }}" required
+           style="width:100%;margin-bottom:10px">
+    <button type="submit">Send to Everyone</button>
+  </form>
+</div>
+
+<div class="card">
   <h2>Admin</h2>
   <p><strong>Queue:</strong> {{ queue_length }} waiting &middot; {{ '15s per build' }}</p>
   {% if queue_entries %}
@@ -26,8 +47,9 @@
     Requests above this get refused rather than silently under-delivered.
   </p>
   <p style="color:var(--text-faint);font-size:12px;margin-bottom:14px">
-    Disk budget: <strong>{{ host.disk_allocated_gb }} / {{ host.disk_budget_gb }} GB</strong> committed
-    (max advertised: {{ (host.disk_budget_gb / 1024) | round(1) }}TB).
+    Disk budget: <strong>{{ host.disk_allocated_gb }} / {{ host.disk_budget_gb }} GB</strong> actually used
+    (max advertised: {{ (host.disk_budget_gb / 1024) | round(1) }}TB). This is real disk usage across all
+    VPSes, not the sum of their quotas — a VPS's disk_gb is just the ceiling it can grow into.
     {% if host.real_disk_gb %}Host's real physical disk is ~{{ (host.real_disk_gb / 1024) | round(1) }}TB, but that
     number is not used for allocation — some of it is already eaten by something that overran its expected
     usage, so the {{ (host.disk_budget_gb / 1024) | round(1) }}TB budget above is the actual enforced cap.{% endif %}
@@ -70,6 +92,17 @@
         <td>{{ v.status }}</td>
         <td>{% if v.status == 'running' and v.ssh_command %}<a href="{{ v.ssh_command }}" target="_blank" rel="noopener">open</a>{% else %}—{% endif %}</td>
         <td>
+          {% if v.status == 'running' %}
+            <form method="POST" action="{{ url_for('vps_power', vps_id=v.id, action='stop') }}"><button>Stop</button></form>
+          {% elif v.status == 'stopped' %}
+            <form method="POST" action="{{ url_for('vps_power', vps_id=v.id, action='start') }}"><button>Start</button></form>
+          {% endif %}
+          {% if v.status in ['running', 'stopped', 'failed'] %}
+            <form method="POST" action="{{ url_for('vps_power', vps_id=v.id, action='reinstall') }}"
+                  onsubmit="return confirm('Wipe and reinstall this user\'s VPS?')">
+              <button class="btn-danger">Reinstall</button>
+            </form>
+          {% endif %}
           <form method="POST" action="{{ url_for('admin_vps_action', vps_id=v.id, action='suspend') }}"><button>Suspend</button></form>
           <form method="POST" action="{{ url_for('admin_vps_action', vps_id=v.id, action='unsuspend') }}"><button>Unsuspend</button></form>
           <form method="POST" action="{{ url_for('admin_vps_action', vps_id=v.id, action='delete') }}"><button class="btn-danger">Delete</button></form>
