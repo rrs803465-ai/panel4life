@@ -136,7 +136,7 @@ def _wait_running(inst, timeout=30):
     return False
 
 
-MAX_TOTAL_VPS = 500
+MAX_TOTAL_VPS = 150  # hard per-node cap — see NODE_FULL_MESSAGE in app.py for what users see
 
 
 def count_all_vps():
