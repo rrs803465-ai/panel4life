@@ -4,7 +4,7 @@ from flask import Flask, request, render_template, redirect, url_for, jsonify, s
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from vps import create_vps_container, destroy_vps, suspend_vps, unsuspend_vps, regen_sshx, get_container_stats, build_logs_stream, can_create_vps, can_allocate_disk, add_port_forward, remove_port_forward, list_port_forwards, MAX_TOTAL_VPS, get_host_capacity
+from vps import create_vps_container, destroy_vps, suspend_vps, unsuspend_vps, regen_sshx, get_container_stats, build_logs_stream, can_create_vps, can_allocate_disk, add_port_forward, remove_port_forward, list_port_forwards, MAX_TOTAL_VPS, get_host_capacity, start_vps, stop_vps, reinstall_vps, get_vps_status, sync_status
 from monitor import start_monitor
 import queue_manager as queue
 import node_mesh
@@ -51,6 +51,12 @@ ADMIN_MAX_DISK_GB = 500
 # Simple per-IP debounce so rapid re-clicking "Create VPS" can't queue-spam.
 _last_create_click = {}
 CREATE_DEBOUNCE_SECONDS = 10
+
+# Per-VPS debounce for start/stop/reinstall so a user can't spam these
+# (each hits LXD directly, and reinstall in particular is expensive/destructive).
+_last_power_action = {}
+POWER_DEBOUNCE_SECONDS = 10
+REINSTALL_DEBOUNCE_SECONDS = 60
 
 # Standard per-user disk quota. Kept as one constant so the pre-flight
 # budget check in vps_create() and the actual container creation in
@@ -115,7 +121,16 @@ def init_db():
         verified_at INTEGER NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS broadcast (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        message TEXT,
+        active INTEGER DEFAULT 0,
+        updated_at INTEGER
+    );
     """)
+    # Single-row table (id is CHECK'd to 1) — seed it once so later
+    # UPDATE ... WHERE id=1 always has a row to hit.
+    db.execute("INSERT OR IGNORE INTO broadcast(id, message, active, updated_at) VALUES(1, '', 0, 0)")
     # Migrate older DBs where vps.user_id had a UNIQUE constraint (one VPS
     # per user) — admins can now grant multiple VPSes per user, so that
     # constraint has to go. SQLite can't ALTER a column's constraints
@@ -153,6 +168,17 @@ def init_db():
     db.commit()
     node_mesh.init_mesh_tables(db)
     db.close()
+
+
+@app.context_processor
+def inject_broadcast():
+    """Makes broadcast_message available in every template (base.html reads
+    it to show/hide the site-wide banner) without every single route having
+    to fetch and pass it individually."""
+    db = get_db()
+    row = db.execute("SELECT message, active FROM broadcast WHERE id=1").fetchone()
+    db.close()
+    return dict(broadcast_message=row["message"] if row and row["active"] and row["message"] else None)
 
 
 class User(UserMixin):
@@ -349,6 +375,16 @@ def dashboard():
     if not vps and all_vps:
         vps = all_vps[0]
 
+    # Catch a container that silently drifted out of sync with the DB (host
+    # reboot, OOM kill, crash, manual `lxc stop`) so Start/Stop always
+    # reflect reality instead of a stale DB row.
+    if vps and vps["status"] in ("running", "stopped"):
+        real_status = sync_status(vps["container_id"], vps["status"])
+        if real_status != vps["status"]:
+            db.execute("UPDATE vps SET status=? WHERE id=?", (real_status, vps["id"]))
+            db.commit()
+            vps = db.execute("SELECT * FROM vps WHERE id=?", (vps["id"],)).fetchone()
+
     feedback_rows = db.execute("""SELECT feedback.*, users.username FROM feedback
                                   JOIN users ON users.id = feedback.user_id
                                   ORDER BY feedback.created_at DESC LIMIT 20""").fetchall()
@@ -394,10 +430,12 @@ def vps_create():
     if not allowed:
         return "NODE IS FULL!! PLEASE WAIT FOR ANOTHER NODE BEING DEPLOYED BY DXD", 503
 
-    disk_allowed, disk_allocated, disk_budget = can_allocate_disk(STANDARD_VPS_DISK_GB)
+    disk_allowed, disk_allocated, disk_budget, disk_reason = can_allocate_disk(STANDARD_VPS_DISK_GB)
     if not disk_allowed:
-        return (f"Disk budget reached ({disk_allocated}/{disk_budget} GB committed). "
-                f"No new VPS can be created until space frees up — try again later."), 503
+        return disk_reason or (
+            f"Disk budget reached ({disk_allocated}/{disk_budget} GB used). "
+            f"No new VPS can be created until space frees up — try again later."
+        ), 503
 
     now = int(time.time())
     last_click = _last_create_click.get(ip, 0)
@@ -468,6 +506,12 @@ def vps_view(vps_id):
     vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
     if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
         return "Not found", 404
+    if vps["status"] in ("running", "stopped"):
+        real_status = sync_status(vps["container_id"], vps["status"])
+        if real_status != vps["status"]:
+            db.execute("UPDATE vps SET status=? WHERE id=?", (real_status, vps_id))
+            db.commit()
+            vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
     queue_pos = queue.get_position(vps_id) if vps["status"] in ("queued", "creating") else 0
     return render_template("vps_view.html", vps=vps, queue_pos=queue_pos, slot_seconds=queue.SLOT_SECONDS)
 
@@ -594,6 +638,108 @@ def regen_ssh(vps_id):
     return redirect(url_for("vps_view", vps_id=vps_id))
 
 
+@app.route("/vps/<int:vps_id>/power/<action>", methods=["POST"])
+@login_required
+def vps_power(vps_id, action):
+    if action not in ("start", "stop", "reinstall"):
+        return "Unknown action", 400
+
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    if not vps:
+        flash("VPS not found")
+        return redirect(url_for("dashboard"))
+    if vps["user_id"] != current_user.id and not current_user.is_admin:
+        flash("Not your VPS")
+        return redirect(url_for("dashboard"))
+
+    # Reconcile against reality first — e.g. don't refuse "start" just
+    # because the DB still says "running" after the container actually
+    # crashed or the host rebooted.
+    if vps["status"] in ("running", "stopped"):
+        real_status = sync_status(vps["container_id"], vps["status"])
+        if real_status != vps["status"]:
+            db.execute("UPDATE vps SET status=? WHERE id=?", (real_status, vps_id))
+            db.commit()
+            vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+
+    debounce = REINSTALL_DEBOUNCE_SECONDS if action == "reinstall" else POWER_DEBOUNCE_SECONDS
+    now = time.time()
+    if now - _last_power_action.get(vps_id, 0) < debounce:
+        flash("Please wait a bit before trying that again.")
+        return redirect(url_for("dashboard", vps_id=vps_id))
+    _last_power_action[vps_id] = now
+
+    if action == "start":
+        if vps["status"] != "stopped":
+            flash("VPS must be stopped to start it")
+            return redirect(url_for("dashboard", vps_id=vps_id))
+        try:
+            result = start_vps(vps["container_id"])
+            if "error" in result:
+                flash(f"Failed to start: {result['error']}")
+            else:
+                db.execute("UPDATE vps SET status='running' WHERE id=?", (vps_id,))
+                db.commit()
+                flash("VPS started")
+        except Exception as e:
+            flash(f"Failed to start: {e}")
+
+    elif action == "stop":
+        if vps["status"] != "running":
+            flash("VPS must be running to stop it")
+            return redirect(url_for("dashboard", vps_id=vps_id))
+        try:
+            result = stop_vps(vps["container_id"])
+            if "error" in result:
+                flash(f"Failed to stop: {result['error']}")
+            else:
+                db.execute("UPDATE vps SET status='stopped' WHERE id=?", (vps_id,))
+                db.commit()
+                flash("VPS stopped")
+        except Exception as e:
+            flash(f"Failed to stop: {e}")
+
+    elif action == "reinstall":
+        if vps["status"] not in ("running", "stopped", "failed"):
+            flash("VPS can't be reinstalled while it's queued or already building")
+            return redirect(url_for("dashboard", vps_id=vps_id))
+        # Forwards point at devices on the container that's about to be
+        # destroyed — meaningless (and would error on removal) against
+        # whatever gets created in its place, so drop them now.
+        db.execute("DELETE FROM port_forwards WHERE vps_id=?", (vps_id,))
+        db.execute("UPDATE vps SET status='creating', ssh_command=NULL WHERE id=?", (vps_id,))
+        db.commit()
+        threading.Thread(
+            target=_reinstall_vps_worker,
+            args=(vps_id, vps["container_id"], f"vps-{vps['user_id']}"),
+            daemon=True,
+        ).start()
+        flash("Reinstalling your VPS — this can take a minute or two.")
+
+    return redirect(url_for("dashboard", vps_id=vps_id))
+
+
+def _reinstall_vps_worker(vps_id, old_container_id, username):
+    """Background worker for the 'reinstall' action — deletes the old
+    container and builds a fresh one with the same specs, then updates the
+    DB row. Mirrors _build_vps()'s failure handling: marks 'failed' with
+    the error stashed in ssh_command rather than leaving the VPS stuck in
+    'creating' forever."""
+    try:
+        new_cid, new_ssh = reinstall_vps(old_container_id, username)
+        db = get_db()
+        db.execute("UPDATE vps SET container_id=?, ssh_command=?, status='running' WHERE id=?",
+                   (new_cid, new_ssh, vps_id))
+        db.commit()
+        db.close()
+    except Exception as e:
+        db = get_db()
+        db.execute("UPDATE vps SET status='failed', ssh_command=? WHERE id=?", (str(e), vps_id))
+        db.commit()
+        db.close()
+
+
 @app.route("/feedback", methods=["POST"])
 @login_required
 def submit_feedback():
@@ -690,9 +836,47 @@ def admin():
     ).fetchall()
     queue_entries = queue.peek_all()
     host = get_host_capacity()
+    broadcast = db.execute("SELECT message, active FROM broadcast WHERE id=1").fetchone()
     return render_template("admin.html", vpses=rows, users=users,
                             queue_length=queue.queue_length(), queue_entries=queue_entries,
-                            host=host)
+                            host=host, broadcast=broadcast)
+
+
+@app.route("/admin/broadcast", methods=["POST"])
+@login_required
+def admin_broadcast_set():
+    """'Message All' — posts a site-wide banner shown to every user on
+    every page (rendered via the broadcast_message context processor into
+    base.html). Only one message is active at a time; posting a new one
+    replaces whatever was there before."""
+    if not current_user.is_admin:
+        return "Forbidden", 403
+    message = request.form.get("message", "").strip()[:500]
+    if not message:
+        flash("Message can't be empty")
+        return redirect(url_for("admin"))
+    db = get_db()
+    db.execute("UPDATE broadcast SET message=?, active=1, updated_at=? WHERE id=1",
+               (message, int(time.time())))
+    db.commit()
+    flash("Message posted to all users")
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/broadcast/clear", methods=["POST"])
+@login_required
+def admin_broadcast_clear():
+    """'Stop Message' — hides the banner for everyone. Keeps the last
+    message text in the DB (just flips active off) so re-posting the same
+    thing later doesn't require retyping it — see the admin.html form,
+    which prefills from the last message."""
+    if not current_user.is_admin:
+        return "Forbidden", 403
+    db = get_db()
+    db.execute("UPDATE broadcast SET active=0 WHERE id=1")
+    db.commit()
+    flash("Message removed")
+    return redirect(url_for("admin"))
 
 
 @app.route("/admin/grant-vps", methods=["POST"])
@@ -737,10 +921,12 @@ def admin_grant_vps():
     # allocation ceiling since something already overran its expected usage
     # on it. This is a hard business-rule cap, separate from the physical
     # clamp checks above.
-    disk_allowed, disk_allocated, disk_budget = can_allocate_disk(disk_gb)
+    disk_allowed, disk_allocated, disk_budget, disk_reason = can_allocate_disk(disk_gb)
     if not disk_allowed:
-        return (f"Disk budget reached ({disk_allocated}/{disk_budget} GB committed across all VPSes) — "
-                f"granting {disk_gb}GB would exceed the panel's 6TB total disk budget. Free up space first."), 400
+        return disk_reason or (
+            f"Disk budget reached ({disk_allocated}/{disk_budget} GB used across all VPSes) — "
+            f"granting {disk_gb}GB would exceed the panel's 6TB total disk budget. Free up space first."
+        ), 400
 
     target = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
     if not target:
@@ -786,6 +972,10 @@ def admin_vps_action(vps_id, action):
         db.execute("UPDATE vps SET status='running' WHERE id=?", (vps_id,))
     elif action == "delete":
         destroy_vps(vps["container_id"])
+        # Clean up rows that reference this vps_id — nothing reuses
+        # AUTOINCREMENT ids so these can't collide with a future VPS, but
+        # they'd otherwise sit in the DB forever pointing at nothing.
+        db.execute("DELETE FROM port_forwards WHERE vps_id=?", (vps_id,))
         db.execute("DELETE FROM vps WHERE id=?", (vps_id,))
     db.commit()
     return redirect(url_for("admin"))
