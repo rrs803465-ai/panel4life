@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+  <h2>Welcome, {{ current_user.username }}</h2>
+  <p>Plan: 60GB RAM &middot; 4 vCPU &middot; 80GB Disk (1 self-service VPS per account — admins can grant extra)</p>
+</div>
+
+<div class="card">
+  <h3>Your VPS</h3>
+
+  {% if all_vps|length > 1 %}
+    <form method="GET" style="margin-bottom:14px">
+      <select name="vps_id" onchange="this.form.submit()">
+        {% for v in all_vps %}
+          <option value="{{ v.id }}" {% if vps and v.id == vps.id %}selected{% endif %}>
+            VPS #{{ v.id }} — {{ v.status }}
+          </option>
+        {% endfor %}
+      </select>
+    </form>
+  {% endif %}
+
+  {% if not vps %}
+    <p>You don't have a VPS yet.</p>
+    <form method="POST" action="{{ url_for('vps_create') }}">
+      <button type="submit">Create VPS</button>
+    </form>
+
+  {% elif vps.status in ['queued', 'creating'] %}
+    <div class="queue-banner" id="queue-banner">
+      {% if vps.status == 'queued' %}
+        <div class="pos" id="queue-pos">#{{ queue_pos if queue_pos else '—' }}</div>
+        <div class="eta" id="queue-eta">in line &middot; ~{{ (queue_pos * slot_seconds) if queue_pos else 0 }}s estimated wait</div>
+      {% else %}
+        <div class="pos">Building&hellip;</div>
+        <div class="eta">Your VPS is being created right now, this can take a minute or two.</div>
+      {% endif %}
+    </div>
+    <p style="font-size:13px;color:var(--text-faint)">This page updates automatically — no need to refresh.</p>
+    <script>
+      (function poll(){
+        fetch("{{ url_for('vps_queue_status', vps_id=vps.id) }}")
+          .then(r => r.json())
+          .then(data => {
+            if (data.status === 'queued') {
+              document.getElementById('queue-pos').textContent = data.position ? ('#' + data.position) : '—';
+              document.getElementById('queue-eta').textContent = 'in line · ~' + data.eta_seconds + 's estimated wait';
+              setTimeout(poll, 3000);
+            } else if (data.status === 'creating') {
+              setTimeout(poll, 3000);
+            } else {
+              location.reload();
+            }
+          })
+          .catch(() => setTimeout(poll, 5000));
+      })();
+    </script>
+
+  {% elif vps.status == 'failed' %}
+    <p style="color:#ffb4ae">Build failed.</p>
+    <p><code style="white-space:normal;display:inline-block;max-width:100%">{{ vps.ssh_command }}</code></p>
+    <form method="POST" action="{{ url_for('vps_dismiss', vps_id=vps.id) }}">
+      <button type="submit" class="btn-danger">Dismiss &amp; Try Again</button>
+    </form>
+
+  {% elif vps.status == 'suspended' %}
+    <p>Status: <span class="badge">suspended</span></p>
+    <p style="color:var(--text-dim);font-size:13px">Your VPS was suspended by an admin. Contact support if you believe this is a mistake.</p>
+
+  {% else %}
+    <div id="stats-line" style="margin-bottom:14px">
+      <span class="stat">CPU<b id="s-cpu">&mdash;</b></span>
+      <span class="stat">RAM<b id="s-mem">&mdash;</b></span>
+      <span class="stat">Uptime<b id="s-uptime">&mdash;</b></span>
+    </div>
+    <p><strong>Terminal:</strong> <a href="{{ vps.ssh_command }}" target="_blank" rel="noopener"><code>{{ vps.ssh_command }}</code></a></p>
+    <p style="font-size:12.5px;color:var(--text-faint)">Opens a live shell in your browser — no SSH client needed. Don't share this link with anyone you don't want in your VPS.</p>
+    <p><strong>Status:</strong> {{ vps.status }}</p>
+    <form method="POST" action="{{ url_for('regen_ssh', vps_id=vps.id) }}" style="margin-top:10px">
+      <button type="submit">New Terminal Link</button>
+    </form>
+    <script>
+      function fmtUptime(s){
+        if (s === null || s === undefined) return '—';
+        const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+        return h > 0 ? (h + 'h ' + m + 'm') : (m + 'm');
+      }
+      function pollStats(){
+        fetch("{{ url_for('vps_stats', vps_id=vps.id) }}")
+          .then(r => r.json())
+          .then(d => {
+            if (!d.error) {
+              document.getElementById('s-cpu').textContent = d.cpu_percent + '%';
+              document.getElementById('s-mem').textContent = d.mem_usage_mb + ' / ' + d.mem_limit_mb + ' MB';
+              document.getElementById('s-uptime').textContent = fmtUptime(d.uptime_seconds);
+            }
+          })
+          .finally(() => setTimeout(pollStats, 5000));
+      }
+      pollStats();
+    </script>
+  {% endif %}
+</div>
+
+{% if can_forward %}
+<div class="card">
+  <h3>Port Forwarding</h3>
+  <p style="font-size:13px;color:var(--text-dim);margin-bottom:14px">
+    Forward a port so external players/services can reach something running inside your VPS
+    (e.g. a Minecraft server). Up to {{ max_forwards }} forwards per VPS.
+  </p>
+
+  {% if forwards %}
+    <table style="margin-bottom:16px">
+      <tr><th>Connect to</th><th>Forwards to</th><th></th></tr>
+      {% for f in forwards %}
+        <tr>
+          <td><code>{{ public_ip if public_ip else 'YOUR_SERVER_IP' }}:{{ f.host_port }}</code> ({{ f.protocol }})</td>
+          <td>container port {{ f.container_port }}</td>
+          <td>
+            <form method="POST" action="{{ url_for('delete_forward', vps_id=vps.id, fwd_id=f.id) }}">
+              <button type="submit" class="btn-danger">Remove</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+
+  {% if forwards|length < max_forwards %}
+    <form method="POST" action="{{ url_for('add_forward', vps_id=vps.id) }}">
+      <input type="number" name="container_port" placeholder="Port inside your VPS (e.g. 25565)" min="1" max="65535" required>
+      <input type="number" name="host_port" placeholder="External port to use (optional — leave blank to auto-match)" min="20000" max="29999">
+      <select name="protocol" style="margin-bottom:10px">
+        <option value="tcp">TCP</option>
+        <option value="udp">UDP</option>
+      </select>
+      <div><button type="submit">Add Forward</button></div>
+    </form>
+  {% else %}
+    <p style="color:var(--text-faint);font-size:13px">Max forwards reached — remove one to add another.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if can_feedback %}
+<div class="card">
+  <h3>Leave Feedback</h3>
+  <form method="POST" action="{{ url_for('submit_feedback') }}">
+    <div class="star-input">
+      <input type="radio" id="star5" name="stars" value="5"><label for="star5">&#9733;</label>
+      <input type="radio" id="star4" name="stars" value="4"><label for="star4">&#9733;</label>
+      <input type="radio" id="star3" name="stars" value="3" checked><label for="star3">&#9733;</label>
+      <input type="radio" id="star2" name="stars" value="2"><label for="star2">&#9733;</label>
+      <input type="radio" id="star1" name="stars" value="1"><label for="star1">&#9733;</label>
+    </div>
+    <input type="text" name="comment" placeholder="What did you think of your VPS?" maxlength="500">
+    <div style="margin-top:10px"><button type="submit">Submit Feedback</button></div>
+  </form>
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>What People Are Saying</h3>
+  {% if feedback_rows %}
+    <div class="feedback-grid">
+      {% for f in feedback_rows %}
+        <div class="feedback-card">
+          <div class="stars-display">
+            {% for i in range(f.stars) %}&#9733;{% endfor %}{% for i in range(5 - f.stars) %}<span class="empty">&#9733;</span>{% endfor %}
+          </div>
+          <div class="fb-user">{{ f.username }}</div>
+          {% if f.comment %}<p>{{ f.comment }}</p>{% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p>No feedback yet — be the first.</p>
+  {% endif %}
+</div>
+
+<p style="margin-top:8px"><a href="{{ url_for('delete_account') }}" style="color:var(--danger)">Delete My Account</a></p>
+{% endblock %}

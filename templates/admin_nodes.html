@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+  <h2>Nodes</h2>
+  <p><strong>This node's capacity:</strong> up to {{ max_vps }} VPS.</p>
+  <p><strong>Your public URL:</strong> {{ my_url if my_url else 'NOT SET — set NODE_PUBLIC_URL and restart' }}</p>
+  <p><strong>Your node's pairing code:</strong> <code style="font-size:18px;letter-spacing:2px">{{ my_code }}</code></p>
+  <p style="color:var(--text-dim);font-size:13px">
+    Share this code with the admin of ANOTHER node (e.g. over Discord) so they can connect
+    to this node. It's regenerated every time this app restarts.
+  </p>
+</div>
+
+<div class="card">
+  <h3>Connect to Another Node</h3>
+  {% if result %}
+    <div class="flash" style="border-left-color: {{ 'var(--danger)' if not result[0] else 'var(--accent)' }}">
+      {{ result[1] }}
+    </div>
+  {% endif %}
+  <form method="POST">
+    <input type="text" name="remote_url" placeholder="Other node's URL (e.g. https://node2.example.com)" required>
+    <input type="text" name="remote_code" placeholder="Other node's 8-digit pairing code" maxlength="8" required>
+    <div style="margin-top:12px"><button type="submit">Connect Node</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <h3>Connected Nodes</h3>
+  {% if nodes %}
+    <table>
+      <tr><th>URL</th><th>Connected</th></tr>
+      {% for n in nodes %}
+        <tr><td>{{ n.url }}</td><td>{{ n.connected_at }}</td></tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p style="color:var(--text-dim)">No nodes connected yet.</p>
+  {% endif %}
+</div>
+{% endblock %}
