@@ -67,6 +67,19 @@
     <p>Status: <span class="badge">suspended</span></p>
     <p style="color:var(--text-dim);font-size:13px">Your VPS was suspended by an admin. Contact support if you believe this is a mistake.</p>
 
+  {% elif vps.status == 'stopped' %}
+    <p><strong>Status:</strong> stopped</p>
+    <p style="font-size:12.5px;color:var(--text-faint)">Your VPS is powered off. Start it to get a new terminal link.</p>
+    <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
+      <form method="POST" action="{{ url_for('vps_power', vps_id=vps.id, action='start') }}">
+        <button type="submit">Start</button>
+      </form>
+      <form method="POST" action="{{ url_for('vps_power', vps_id=vps.id, action='reinstall') }}"
+            onsubmit="return confirm('This wipes everything on the VPS and reinstalls it fresh. Continue?')">
+        <button type="submit" class="btn-danger">Reinstall</button>
+      </form>
+    </div>
+
   {% else %}
     <div id="stats-line" style="margin-bottom:14px">
       <span class="stat">CPU<b id="s-cpu">&mdash;</b></span>
@@ -76,9 +89,19 @@
     <p><strong>Terminal:</strong> <a href="{{ vps.ssh_command }}" target="_blank" rel="noopener"><code>{{ vps.ssh_command }}</code></a></p>
     <p style="font-size:12.5px;color:var(--text-faint)">Opens a live shell in your browser — no SSH client needed. Don't share this link with anyone you don't want in your VPS.</p>
     <p><strong>Status:</strong> {{ vps.status }}</p>
-    <form method="POST" action="{{ url_for('regen_ssh', vps_id=vps.id) }}" style="margin-top:10px">
-      <button type="submit">New Terminal Link</button>
-    </form>
+    <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
+      <form method="POST" action="{{ url_for('regen_ssh', vps_id=vps.id) }}">
+        <button type="submit">New Terminal Link</button>
+      </form>
+      <form method="POST" action="{{ url_for('vps_power', vps_id=vps.id, action='stop') }}"
+            onsubmit="return confirm('Stop this VPS? Anything running inside it will be shut down.')">
+        <button type="submit" class="btn-danger">Stop</button>
+      </form>
+      <form method="POST" action="{{ url_for('vps_power', vps_id=vps.id, action='reinstall') }}"
+            onsubmit="return confirm('This wipes everything on the VPS and reinstalls it fresh. Continue?')">
+        <button type="submit" class="btn-danger">Reinstall</button>
+      </form>
+    </div>
     <script>
       function fmtUptime(s){
         if (s === null || s === undefined) return '—';
