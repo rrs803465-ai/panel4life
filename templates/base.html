@@ -176,6 +176,16 @@ button:disabled{opacity:0.5;cursor:not-allowed}
   font-size:14px;
 }
 
+.broadcast-banner{
+  background:rgba(255,193,7,0.14);
+  border-bottom:1px solid rgba(255,193,7,0.35);
+  color:var(--text);
+  padding:12px 20px;
+  font-size:14px;
+  text-align:center;
+  font-weight:500;
+}
+
 table{width:100%;border-collapse:collapse;font-size:13.5px}
 th{
   text-align:left;
@@ -284,6 +294,9 @@ form{display:inline}
 </style>
 </head>
 <body>
+{% if broadcast_message %}
+<div class="broadcast-banner">{{ broadcast_message }}</div>
+{% endif %}
 <div class="nav">
   <div class="brand"><span class="mark">▣</span>VPS Panel</div>
   <div class="nav-links">
