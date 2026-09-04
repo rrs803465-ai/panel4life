@@ -25,7 +25,7 @@ IMAGE_ALIAS = os.environ.get("VPS_IMAGE_ALIAS", "ubuntu/22.04")
 # moving from a dir-backed pool to zfs/btrfs for real usage reporting —
 # see get_allocated_disk_gb()'s docstring) — no code edit needed next time,
 # just set the env var.
-STORAGE_POOL = os.environ.get("VPS_STORAGE_POOL", "default")
+STORAGE_POOL = os.environ.get("VPS_STORAGE_POOL", "zfs-new")
 
 def generate_password(length=16):
     alphabet = string.ascii_letters + string.digits
@@ -242,21 +242,20 @@ def can_create_vps():
 
 def create_vps(username, cpu_limit=1, ram_limit_mb=1024, disk_limit_gb=10, image=IMAGE_ALIAS):
     """
-    Create a KVM-backed LXD virtual machine (not an LXC container) — the
-    host node now runs VMs, so every VPS created here is one.
+    Create an LXD system container with real cgroup limits. LXD auto-virtualizes
+    /proc/meminfo, /proc/cpuinfo etc. for containers with limits.memory/limits.cpu
+    set, using its own bundled LXCFS internally — no manual mount setup needed.
 
-    Container-only keys (security.nesting/privileged, syscall intercepts,
-    linux.kernel_modules) are dropped: a VM boots its own real kernel, so
-    Docker/nesting/device-node access just works without any of that, and
-    LXD rejects VM creation outright if you pass container-only config to
-    a "virtual-machine" instance.
+    NOTE: security.privileged=true means root inside the container is real root
+    on the host (no UID namespace remapping). A container escape here means full
+    host compromise. Fine for single-tenant/personal use; risky if other users
+    get their own VPS on this same panel.
     """
     password = generate_password()
     container_name = f"vps-{username}-{secrets.token_hex(3)}"
 
     config = {
         "name": container_name,
-        "type": "virtual-machine",
         "source": {
             "type": "image",
             "alias": image,
@@ -264,6 +263,22 @@ def create_vps(username, cpu_limit=1, ram_limit_mb=1024, disk_limit_gb=10, image
         "config": {
             "limits.cpu": str(cpu_limit),
             "limits.memory": f"{ram_limit_mb}MB",
+            "limits.memory.enforce": "hard",
+            "security.nesting": "true",
+            "security.privileged": "true",
+            # privileged+nesting alone can still leave Docker hitting "operation
+            # not permitted" on certain syscalls inside the nested container
+            # (mknod for device nodes, setxattr for overlayfs metadata). These
+            # tell LXD to intercept and allow those specific syscalls safely
+            # rather than the kernel blanket-denying them.
+            "security.syscalls.intercept.mknod": "true",
+            "security.syscalls.intercept.setxattr": "true",
+            # Docker's default bridge networking needs these two kernel
+            # modules loaded on the host and available to the container.
+            # Harmless to request if they're already loaded — just makes
+            # sure Docker's iptables/bridge setup inside the VPS doesn't
+            # silently fail on hosts where they aren't auto-loaded.
+            "linux.kernel_modules": "overlay,br_netfilter",
         },
         "devices": {
             "root": {
@@ -280,13 +295,11 @@ def create_vps(username, cpu_limit=1, ram_limit_mb=1024, disk_limit_gb=10, image
         inst.start(wait=True)
 
         if not _wait_running(inst):
-            raise RuntimeError("VM did not reach running state in time")
+            raise RuntimeError("Container did not reach running state in time")
 
-        # VMs boot a full guest OS + the lxd-agent before they can accept
-        # exec calls — much slower than a container's near-instant readiness.
-        # Retry instead of a single fixed sleep, so this doesn't silently
-        # skip setting the password on a slower-booting VM while still
-        # returning fast for one that comes up quickly.
+        # Retry instead of a single fixed sleep — harmless if the container
+        # is ready instantly (as containers usually are), but avoids
+        # silently skipping the password set on a slower-booting host.
         _set_root_password_with_retry(inst, password)
 
         return {
@@ -303,7 +316,7 @@ def create_vps(username, cpu_limit=1, ram_limit_mb=1024, disk_limit_gb=10, image
 
 
 def _exec(inst, cmd_list, environment=None):
-    """Run a command inside an LXD instance (container or VM). cmd_list is an argv list, not a shell string."""
+    """Run a command inside an LXD container. cmd_list is an argv list, not a shell string."""
     return inst.execute(cmd_list, environment=environment or {})
 
 
